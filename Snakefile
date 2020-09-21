@@ -1,5 +1,4 @@
 import glob
-import os
 
 
 bacteria_name = glob.glob("*.fasta")[0][:-6]
@@ -7,26 +6,27 @@ storage_prefix = "/scratch/mlebedev"
 
 rule all:
     input: "unaligned.fa",
-            expand("hists/{sample}.png", sample=bacteria_name),
+           "viz.done",
+           f"hists/{bacteria_name}.png",
 
 
 rule download_db:
     output: targz = expand("{storage_prefix}/downloads/bacteria.tar.gz", storage_prefix=storage_prefix)
     params:
-        dir = expand("{storage_prefix}/downloads/", storage_prefix=storage_prefix)
+        dir = storage_prefix + "/downloads/"
     shell: "wget https://zenodo.org/record/3725706/files/bacteria.tar.gz -P {params.dir}"
 
 
 rule unzip:
     input: "{storage_prefix}/downloads/bacteria.tar.gz"
     output: "{storage_prefix}/bacteria/"
-    shell: "mkdir {output} | tar -zxf {input} --directory {output}"
+    shell: "mkdir -p {output} && tar -zxf {input} --directory {output}"
 
 
 rule referenceseeker:
     input:
          genome = "{bacteria}.fasta",
-         bacteria_db = expand("{storage_prefix}/bacteria/", storage_prefix=storage_prefix)
+         bacteria_db = storage_prefix + "/bacteria/"
     output:
         "{bacteria}.refseq"
     conda:
@@ -37,8 +37,8 @@ rule referenceseeker:
 
 rule path_to_relatives:
     input:
-         reference = expand("{bacteria}.refseq", bacteria=bacteria_name),
-         bacteria_db = expand("{storage_prefix}/bacteria/", storage_prefix=storage_prefix)
+         reference = bacteria_name + ".refseq",
+         bacteria_db = storage_prefix + "/bacteria/"
     output:
          "path_to_refs.txt"
     run:
@@ -49,56 +49,39 @@ rule path_to_relatives:
                 out.write(f"{input.bacteria_db}{i}.fna\n")
 
 
-rule cp_relatives:
-    input: "path_to_refs.txt"
-    output: "references/"
-    shell:
-        'mkdir -p references && '
-        'cp `cat {input}` references && '
-        'mv references/* {output}'
-
-
-IDS = glob_wildcards("references/{id}.fna")
-
-## TODO: messed up the wildcards
 rule mashmap:
     input:
-        reference = expand("references/{ref_genomes}.fna", ref_genomes=IDS),
-        genome = expand("{bacteria}.fasta", bacteria=bacteria_name)
+        reference = "path_to_refs.txt",
+        genome = "{bacteria_name}.fasta"
     conda:
         "envs/mashmap.yml"
     threads: 10
     output:
-        expand("mashmap/{bacteria}_{ref_genomes}_out.mashmap", ref_genomes=IDS, bacteria=bacteria_name)
+        "mashmap/{bacteria_name}_out.mashmap"
     shell:
-        'mkdir -p mashmap &&'
-        'mashmap -r {input.reference} -q {input.genome} -s 500b -t {threads} --perc_identity 95 -o mashmap/{output}'
+        '''
+        mashmap --rl {input.reference} -q {input.genome} -s 500 -t {threads} --perc_identity 95 -o {output}
+        '''
 
 
 rule get_nonaligned:
-    input:
-        mashmaps = expand("mashmap/{bacteria}_{ref_genomes}_out.mashmap", ref_genomes=IDS, bacteria=bacteria_name)
-    params:
-        mashmaps_dir = "mashmap/"
+    input: f"mashmap/{bacteria_name}_out.mashmap"
     output: "instruction_to_cut.bed"
     run:
-        for root, dirs, files in os.walk(f"{params.mashmaps_dir}"):
-            for file in files:
-                ranges = []
-                name = None
-                with open(file) as m:
-                    for line in m.readlines():
-                        ranges.append([int(i) for i in line.split()[2:4]])
-                        name = line.split()[0]
+        ranges = []
+        name = None
+        with open(f"{input}") as m:
+            for line in m.readlines():
+                ranges.append([int(i) for i in line.split()[2:4]])
+                name = line.split()[0]
 
-                ranges.sort(key=lambda x: x[0])
-
-                for num, i in enumerate(ranges[1::]):
-                    num_to_append = ranges[num][1]
-                    if i[0] - ranges[num][1] > 1:
-                        print(ranges[num][1], i[0])
-                        with open(f"{output}", "a") as out:
-                            out.write("\t".join((name, str(ranges[num][1]), str(i[0]))) +  "\n")
+        ranges.sort(key=lambda x: x[0])
+        for num, i in enumerate(ranges[1::]):
+            num_to_append = ranges[num][1]
+            if i[0] - ranges[num][1] > 1:
+                print(ranges[num][1], i[0])
+                with open(f"{output}", "a") as out:
+                    out.write("\t".join((name, str(ranges[num][1]), str(i[0]))) +  "\n")
 
 
 rule bedtools:
@@ -108,12 +91,10 @@ rule bedtools:
     shell: "bedtools getfasta -fi {input.genome} -bed {input.cut} -fo {output}"
 
 
-
-
 rule prodigal:
-	input: expand("{bacteria}.fasta", bacteria=bacteria_name)
-	output: "proteins/{bacteria}.faa"
-	shell: "prodigal -a {output} -q -i {input}"
+    input: expand("{bacteria}.fasta", bacteria=bacteria_name)
+    output: "proteins/{bacteria}.faa"
+    shell: "prodigal -a {output} -q -i {input}"
 
 
 rule diamond:
@@ -121,9 +102,13 @@ rule diamond:
 	output: "lengths/{bacteria}.data"
 	threads: 10
 	params:
-		db="/scratch/mlebedev/uniprot_trembl.diamond.dmnd",
-		of="6 qlen slen"
-	shell: "diamond blastp --threads {threads} --max-target-seqs 1 --db {params.db} --query {input} --outfmt {params.of} --out {output}"
+		db = "/scratch/mlebedev/uniprot_trembl.diamond.dmnd",
+		of = "6 qlen slen"
+	shell:
+            '''
+            diamond blastp --threads {threads} --max-target-seqs 1 --db {params.db} \
+            --query {input} --outfmt {params.of} --out {output}
+            '''
 
 
 rule hist:
@@ -131,16 +116,52 @@ rule hist:
 	output: "hists/{bacteria}.png"
 	shell: "Rscript ../ideel/scripts/hist.R {input} {output}"
 
-## TODO Change to make it work with multiple genomes
-rule prokka:
-    input: expand("{bacteria}.fasta", bacteria=bacteria_name)
-    output: "prokka/{bacteria_name}.gff"
-    threads: 4
-    shell: "prokka --outdir {output} --prefix {bacteria_name} {input} -cpus {threads}"
 
+rule make_prokka_input:
+    input: refs="path_to_refs.txt"
+    params: bacteria_name
+    output: directory("prokka_inp/")
+    shell:
+        '''
+        mkdir -p {output} && 
+        cp `cat {input.refs}` {output} && 
+        cp {params}.fasta {output}
+        mv {output}{params}.fasta {output}{params}.fna
+        '''
+
+
+rule prokka:
+    input: "prokka_inp/"
+    output: directory("prokka/")
+    threads: 10
+    shell: '''
+            for file in $(ls {input} | rev | cut -c5- | rev)
+            do prokka --outdir prokka --prefix $file {input}$file.fna -cpus {threads} --force
+            done
+           '''
+
+IDS_roary_in = glob_wildcards("prokka/{id}.gff")
 
 rule roary:
-    input: expand("prokka/{bacteria}.gff", bacteria=bacteria_name)
-    output: "roary/"
-    threads: 4
-    shell: "roary -p 4 -f {output}"
+    input: expand("prokka/{id}.gff", id=IDS_roary_in)
+    output: directory("roary_out/")
+    params: "prokka/*.gff"
+    threads: 10
+    shell: "roary -p {threads} -e -n -v -f {output} {params}"
+
+IDS_roary_out = glob_wildcards("roary_out/{dirname}/core_gene_alignment.aln")[0]
+
+rule fast_tree:
+    input:
+         f"roary_out/{IDS_roary_out[0]}/core_gene_alignment.aln"
+    output:
+         f"roary_out/{IDS_roary_out[0]}/core_gene_alignment.newick"
+    shell:
+         "FastTree -nt -gtr {input} > {output}"
+
+rule roary_grahs:
+    input:
+         tree=f"roary_out/{IDS_roary_out[0]}/core_gene_alignment.newick",
+         csv=f"roary_out/{IDS_roary_out[0]}/gene_presence_absence.csv"
+    output: "viz.done"
+    shell: "python roary_plots/roary_plots.py {input.tree} {input.csv} && touch {output}"
